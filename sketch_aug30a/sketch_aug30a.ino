@@ -1,0 +1,149 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLEHIDDevice.h>
+#include <HIDTypes.h>
+#include <HIDKeyboardTypes.h>
+
+const int SWITCH_PIN = 4;
+bool lastSwitchState = HIGH; // Keeps track of the switch position
+
+const uint8_t REPORT_MAP[] = {
+  0x05, 0x01,  // Usage Page (Generic Desktop Ctrls)
+  0x09, 0x06,  // Usage (Keyboard)
+  0xA1, 0x01,  // Collection (Application)
+  0x85, 0x01,  //   Report ID (1)
+  0x05, 0x07,  //   Usage Page (Kbrd/Keypad)
+  0x19, 0xE0,  //   Usage Minimum (0xE0)
+  0x29, 0xE7,  //   Usage Maximum (0xE7)
+  0x15, 0x00,  //   Logical Minimum (0)
+  0x25, 0x01,  //   Logical Maximum (1)
+  0x75, 0x01,  //   Report Size (1)
+  0x95, 0x08,  //   Report Count (8)
+  0x81, 0x02,  //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+  0x95, 0x01,  //   Report Count (1)
+  0x75, 0x08,  //   Report Size (8)
+  0x81, 0x01,  //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
+  0x95, 0x05,  //   Report Count (5)
+  0x75, 0x01,  //   Report Size (1)
+  0x05, 0x08,  //   Usage Page (LEDs)
+  0x19, 0x01,  //   Usage Minimum (1)
+  0x29, 0x05,  //   Usage Maximum (5)
+  0x91, 0x02,  //   Output (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+  0x95, 0x01,  //   Report Count (1)
+  0x75, 0x03,  //   Report Size (3)
+  0x91, 0x01,  //   Output (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
+  0x95, 0x06,  //   Report Count (6)
+  0x75, 0x08,  //   Report Size (8)
+  0x15, 0x00,  //   Logical Minimum (0)
+  0x25, 0x65,  //   Logical Maximum (101)
+  0x05, 0x07,  //   Usage Page (Kbrd/Keypad)
+  0x19, 0x00,  //   Usage Minimum (0)
+  0x29, 0x65,  //   Usage Maximum (0x65)
+  0x81, 0x00,  //   Input (Data,Array,Abs,No Wrap,Logical,Preferred State,No Null Position)
+  0xC0         // End Collection
+};
+
+BLEHIDDevice* hid;
+BLECharacteristic* inputKeyboard;
+bool connected = false;
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    connected = true;
+    Serial.println("Device connected!");
+  }
+  void onDisconnect(BLEServer* pServer) {
+    connected = false;
+    Serial.println("Device disconnected!");
+    pServer->getAdvertising()->start();
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Set switch pin with internal pull-up
+  pinMode(SWITCH_PIN, INPUT_PULLUP);
+  lastSwitchState = digitalRead(SWITCH_PIN);
+
+  Serial.println("Starting BLE Keyboard HID with Switch...");
+
+  BLEDevice::init("ESP32_TextKeyboard");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  hid = new BLEHIDDevice(pServer);
+  inputKeyboard = hid->inputReport(1);
+
+  hid->manufacturer()->setValue("CustomMaker");
+  hid->pnp(0x02, 0x045e, 0x0241, 0x0110);
+  hid->hidInfo(0x00, 0x01);
+
+  BLESecurity *pSecurity = new BLESecurity();
+  pSecurity->setAuthenticationMode(ESP_LE_AUTH_BOND);
+
+  hid->reportMap((uint8_t*)REPORT_MAP, sizeof(REPORT_MAP));
+  hid->startServices();
+
+  BLEAdvertising *pAdvertising = pServer->getAdvertising();
+  pAdvertising->setAppearance(HID_KEYBOARD);
+  pAdvertising->addServiceUUID(hid->hidService()->getUUID());
+  pAdvertising->start();
+  
+  Serial.println("Ready! Connect via Bluetooth and flip your switch.");
+}
+
+void sendKey(uint8_t modifier, uint8_t key) {
+  uint8_t msg[8] = {modifier, 0, key, 0, 0, 0, 0, 0};
+  inputKeyboard->setValue(msg, sizeof(msg));
+  inputKeyboard->notify();
+  
+  // Slower delay so phones/PCs don't register stuck keys
+  delay(50); 
+  
+  uint8_t emptyMsg[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  inputKeyboard->setValue(emptyMsg, sizeof(emptyMsg));
+  inputKeyboard->notify();
+  
+  delay(50); 
+}
+
+void typeChar(char c) {
+  if (c == ' ') {
+    sendKey(0, 44);
+  } else if (c >= 'a' && c <= 'z') {
+    sendKey(0, 4 + (c - 'a'));
+  } else if (c >= 'A' && c <= 'Z') {
+    sendKey(0x02, 4 + (c - 'A'));
+  } else if (c == '\n') {
+    sendKey(0, 40);
+  }
+}
+
+void typeString(String s) {
+  for (int i = 0; i < s.length(); i++) {
+    typeChar(s[i]);
+  }
+}
+
+void loop() {
+  if (connected) {
+    bool currentSwitchState = digitalRead(SWITCH_PIN);
+
+    // Check if the switch state changed to LOW (flipped ON)
+    if (currentSwitchState == LOW && lastSwitchState == HIGH) {
+      Serial.println("Switch flipped ON! Typing message...");
+      
+      for (int i = 0; i < 10; i++) {
+        typeString("you have been hacked\n");
+        delay(200);
+      }
+      
+      Serial.println("Done typing!");
+    }
+
+    lastSwitchState = currentSwitchState; 
+    delay(50); 
+  }
+}
