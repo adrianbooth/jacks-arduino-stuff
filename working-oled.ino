@@ -8,8 +8,8 @@
 // =========================================================================
 //  USER CONFIGURATION
 // =========================================================================
-const char* WIFI_SSID = "internet";
-const char* WIFI_PASS = "jakederg";
+const char* WIFI_SSID = "your-internet-name";
+const char* WIFI_PASS = "your-internet-password";
 
 WiFiServer server(80);
 
