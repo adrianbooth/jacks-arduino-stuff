@@ -1,6 +1,8 @@
+#include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_SHT31.h>
 #include <WiFi.h>
 
 // =========================================================================
@@ -18,14 +20,17 @@ WiFiServer server(80);
 #define SCREEN_ADDRESS 0x3C 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-#define SOIL_PIN 34    // ESP32 Analog Pin for Soil Moisture
-#define TEMP_PIN 35    // ESP32 Analog Pin for 2-Pin Air Thermistor
+// GXHT30 I2C Sensor (Detected at 0x44)
+Adafruit_SHT31 sht30 = Adafruit_SHT31();
 
-const int DRY_VALUE = 3000;   // ESP32 ADC reads up to 4095
-const int WET_VALUE = 1200;    
+#define SOIL_PIN 26    
 
-// Global Variables
+const int DRY_VALUE = 1000;   
+const int WET_VALUE = 300;    
+
+// Global Shared Variables
 float temperature = 0.0;       
+float humidity = 0.0;
 int soilMoisturePercent = 0;
 bool isUnplugged = false;
 
@@ -39,16 +44,23 @@ bool showAlertState = true;
 void setup() {
   Serial.begin(9600);
   
-  // ESP32 Default I2C Pins (SDA = 21, SCL = 22)
-  Wire.begin(21, 22);
+  // Initialize I2C on Pi Pico for GP4 (SDA) and GP5 (SCL)
+  Wire.setSDA(4);
+  Wire.setSCL(5);
+  Wire.begin();
   
+  // Initialize OLED
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     for(;;);
   }
   Wire.setClock(400000); 
   
+  // Initialize GXHT30 Sensor at 0x44
+  if (!sht30.begin(0x44)) {
+    Serial.println("Couldn't find GXHT30 sensor! Check wiring.");
+  }
+
   pinMode(SOIL_PIN, INPUT);
-  pinMode(TEMP_PIN, INPUT);
   
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -64,6 +76,10 @@ void setup() {
     retries++;
   }
 
+  Serial.println("");
+  Serial.print("Connected! IP Address: ");
+  Serial.println(WiFi.localIP());
+
   server.begin();
 }
 
@@ -74,14 +90,18 @@ void loop() {
   if (currentMillis - previousSensorMillis >= sensorInterval) {
     previousSensorMillis = currentMillis;
 
-    // Read 2-Pin Thermistor (Convert analog 0-4095 to an estimated Celsius value)
-    int rawTemp = analogRead(TEMP_PIN);
-    // Basic rough mapping for a standard 10k thermistor voltage divider:
-    temperature = map(rawTemp, 4000, 500, 0, 50); 
+    float newTemp = sht30.readTemperature();
+    float newHum = sht30.readHumidity();
+    
+    if (!isnan(newTemp)) {
+      temperature = newTemp; 
+    }
+    if (!isnan(newHum)) {
+      humidity = newHum;
+    }
 
-    // Read Soil Moisture
     int rawSoil = analogRead(SOIL_PIN);
-    isUnplugged = (rawSoil >= 4050); // ESP32 max pull-up value
+    isUnplugged = (rawSoil >= 1020); 
 
     if (!isUnplugged) {
       soilMoisturePercent = map(rawSoil, DRY_VALUE, WET_VALUE, 0, 100);
@@ -94,7 +114,7 @@ void loop() {
     showAlertState = !showAlertState; 
   }
 
-  // 2. WEB SERVER HANDLING
+  // 2. BULLETPROOF WEB SERVER HANDLING
   WiFiClient client = server.available();
   if (client) {
     String currentLine = "";
@@ -131,7 +151,9 @@ void loop() {
       client.println();
 
       client.print("{\"t\":");
-      client.print(temperature, 1);
+      client.print(isnan(temperature) ? 0.0 : temperature, 1);
+      client.print(",\"h\":");
+      client.print(isnan(humidity) ? 0.0 : humidity, 1);
       client.print(",\"m\":");
       client.print(soilMoisturePercent);
       client.print(",\"u\":");
@@ -149,13 +171,13 @@ void loop() {
       client.println("<meta name='viewport' content='width=device-width, initial-scale=1'>");
       client.println("<style>");
       client.println("body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; padding: 20px; }");
-      client.println(".card { background: #1e1e1e; padding: 20px; border-radius: 12px; margin: 15px auto; max-width: 300px; }");
-      client.println(".val { font-size: 2.5em; font-weight: bold; color: #4caf50; }");
+      client.println(".card { background: #1e1e1e; padding: 15px; border-radius: 12px; margin: 12px auto; max-width: 300px; }");
+      client.println(".val { font-size: 2.2em; font-weight: bold; color: #4caf50; }");
       client.println(".alert { color: #f44336; }");
-      client.println(".st { font-weight: bold; margin-top: 10px; }");
+      client.println(".st { font-weight: bold; margin-top: 5px; }");
       client.println("</style></head><body>");
 
-      client.println("<h2>ESP32 Plant Dashboard</h2>");
+      client.println("<h2>Live Plant Dashboard</h2>");
       
       client.println("<div class='card'><h3>Soil Moisture</h3>");
       client.println("<div id='mVal' class='val'>--%</div>");
@@ -164,12 +186,16 @@ void loop() {
       client.println("<div class='card'><h3>Air Temperature</h3>");
       client.println("<div id='tVal' class='val' style='color:#2196f3;'>-- &deg;C</div></div>");
 
+      client.println("<div class='card'><h3>Air Humidity</h3>");
+      client.println("<div id='hVal' class='val' style='color:#00bcd4;'>--%</div></div>");
+
       client.println("<script>");
       client.println("function fetchData() {");
       client.println("  fetch('/data?t=' + Date.now())");
       client.println("    .then(res => res.json())");
       client.println("    .then(data => {");
       client.println("      document.getElementById('tVal').innerHTML = data.t.toFixed(1) + ' &deg;C';");
+      client.println("      document.getElementById('hVal').innerHTML = data.h.toFixed(1) + ' %';");
       client.println("      let m = document.getElementById('mVal');");
       client.println("      let s = document.getElementById('stText');");
       client.println("      if(data.u === 1) {");
@@ -201,43 +227,56 @@ void loop() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(15, 0);
-  display.print("ESP32 PLANT MONITOR");
+  display.print("LIVE PLANT DATA");
   display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
 
-  display.setCursor(0, 18);
-  display.print("Air Temp: ");
-  display.print(temperature, 1);
-  display.print(" C");
+  // Air Temp & Humidity Combined Line
+  display.setCursor(0, 15);
+  display.print("Air:");
+  if (isnan(temperature)) {
+    display.print(" --C");
+  } else {
+    display.print(" ");
+    display.print(temperature, 1);
+    display.print("C");
+  }
+  
+  display.print(" ");
+  if (isnan(humidity)) {
+    display.print("--%");
+  } else {
+    display.print(humidity, 0);
+    display.print("%");
+  }
 
   if (!isUnplugged && soilMoisturePercent <= 20) {
     if (showAlertState) {
-      display.fillRect(0, 32, 128, 32, SSD1306_WHITE);
+      display.fillRect(0, 28, 128, 22, SSD1306_WHITE);
       display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
       display.setTextSize(1);
-      display.setCursor(18, 44);
+      display.setCursor(18, 35);
       display.print("WATER THE PLANT!");
       display.setTextColor(SSD1306_WHITE);
     }
   } 
   else {
-    display.setCursor(0, 34);
+    display.setCursor(0, 30);
     display.print("Soil Moist: ");
     if (isUnplugged) {
       display.setTextSize(1);
-      display.setCursor(68, 34);
+      display.setCursor(72, 30);
       display.print("DISCONN");
     } else {
-      display.setTextSize(2); 
-      display.setCursor(68, 30);
+      display.setTextSize(1); 
+      display.setCursor(72, 30);
       display.print(soilMoisturePercent);
-      display.setTextSize(1);
       display.print("%");
     }
 
-    display.drawRect(0, 52, 128, 10, SSD1306_WHITE);
+    display.drawRect(0, 48, 128, 10, SSD1306_WHITE);
     if (!isUnplugged) {
       int barWidth = map(soilMoisturePercent, 0, 100, 0, 124);
-      display.fillRect(2, 54, barWidth, 6, SSD1306_WHITE);
+      display.fillRect(2, 50, barWidth, 6, SSD1306_WHITE);
     }
   }
 
